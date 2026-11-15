@@ -1,0 +1,20 @@
+# 野外水质探头 · 时钟回拨校时服务
+#
+# 单容器即可运行：FastAPI + SQLite(WAL) + 文件系统发布目录都在一个
+# 进程内。发布协议（分配修订号 -> 原子 rename -> 登记 SQLite）依赖进程级
+# 锁，因此必须保持单 worker（Dockerfile 的 CMD 已固定 --workers 1）。
+services:
+  web:
+    build: .
+    image: wq-clock-correction:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据目录：SQLite 库、原始 CSV、已发布日文件树都在其下
+      WQ_DATA_DIR: /data
+    volumes:
+      - wq-data:/data
+    restart: unless-stopped
+
+volumes:
+  wq-data:

@@ -25,6 +25,16 @@ into place, the publication rows are inserted, and only then is the
 transaction committed.  A failure or a crash at any point rolls the anchors and
 the publication back together, so the database never claims an anchor that has
 no published snapshot behind it.
+
+Consistent reads
+----------------
+The write side is atomic, so the read side must be too: one logical read (one
+page render) that needs several queries runs them inside **one** read
+transaction via :meth:`Store.snapshot`.  In WAL mode a read transaction sees a
+stable snapshot of the last commit as of its first statement, no matter what
+commits while it is open.  A refresh that races a supplement therefore renders
+either the complete old publication or the complete new one — never old
+anchors next to the new publication row.
 """
 
 from __future__ import annotations
@@ -182,6 +192,31 @@ class Store:
             finally:
                 conn.close()
 
+    @contextmanager
+    def snapshot(self) -> Iterator[sqlite3.Connection]:
+        """One consistent read snapshot for any number of queries.
+
+        In WAL mode every statement inside a single read transaction sees the
+        database as of the same commit, even if a writer commits while the
+        snapshot is open.  Use this whenever one logical read (for example one
+        page render) issues several queries that must agree with each other;
+        with separate connections each query could observe a different commit
+        and the response would mix two publications.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------
     # datasets and raw readings
     # ------------------------------------------------------------------
@@ -219,11 +254,15 @@ class Store:
             ).fetchall()
         return [Dataset(**dict(r)) for r in rows]
 
-    def get_dataset(self, dataset_id: int) -> Dataset | None:
-        with self.connect() as conn:
-            row = conn.execute(
-                f"SELECT {_DATASET_COLS} FROM dataset WHERE id=?", (dataset_id,)
-            ).fetchone()
+    def get_dataset(
+        self, dataset_id: int, conn: sqlite3.Connection | None = None
+    ) -> Dataset | None:
+        sql = f"SELECT {_DATASET_COLS} FROM dataset WHERE id=?"
+        if conn is None:
+            with self.connect() as own:
+                row = own.execute(sql, (dataset_id,)).fetchone()
+        else:
+            row = conn.execute(sql, (dataset_id,)).fetchone()
         return Dataset(**dict(row)) if row else None
 
     def readings(
@@ -296,13 +335,18 @@ class Store:
     # publications
     # ------------------------------------------------------------------
 
-    def publications(self, dataset_id: int) -> list[Publication]:
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"SELECT {_PUB_COLS} FROM publication"
-                " WHERE dataset_id=? ORDER BY revision DESC",
-                (dataset_id,),
-            ).fetchall()
+    def publications(
+        self, dataset_id: int, conn: sqlite3.Connection | None = None
+    ) -> list[Publication]:
+        sql = (
+            f"SELECT {_PUB_COLS} FROM publication"
+            " WHERE dataset_id=? ORDER BY revision DESC"
+        )
+        if conn is None:
+            with self.connect() as own:
+                rows = own.execute(sql, (dataset_id,)).fetchall()
+        else:
+            rows = conn.execute(sql, (dataset_id,)).fetchall()
         return [Publication(**dict(r)) for r in rows]
 
     def all_publications(self) -> list[Publication]:
@@ -335,16 +379,24 @@ class Store:
             row = conn.execute(sql, (publication_id,)).fetchone()
         return Publication(**dict(row)) if row else None
 
-    def files(self, publication_id: int) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            return conn.execute(
-                f"SELECT {_FILE_COLS} FROM published_file"
-                " WHERE publication_id=? ORDER BY id",
-                (publication_id,),
-            ).fetchall()
+    def files(
+        self, publication_id: int, conn: sqlite3.Connection | None = None
+    ) -> list[sqlite3.Row]:
+        sql = (
+            f"SELECT {_FILE_COLS} FROM published_file"
+            " WHERE publication_id=? ORDER BY id"
+        )
+        if conn is None:
+            with self.connect() as own:
+                return own.execute(sql, (publication_id,)).fetchall()
+        return conn.execute(sql, (publication_id,)).fetchall()
 
     def get_file(
-        self, publication_id: int, kind: str, day: str | None
+        self,
+        publication_id: int,
+        kind: str,
+        day: str | None,
+        conn: sqlite3.Connection | None = None,
     ) -> sqlite3.Row | None:
         sql = (
             f"SELECT {_FILE_COLS} FROM published_file"
@@ -354,8 +406,10 @@ class Store:
         if day is not None:
             sql += " AND day=?"
             params.append(day)
-        with self.connect() as conn:
-            return conn.execute(sql, params).fetchone()
+        if conn is None:
+            with self.connect() as own:
+                return own.execute(sql, params).fetchone()
+        return conn.execute(sql, params).fetchone()
 
     def insert_publication(
         self,

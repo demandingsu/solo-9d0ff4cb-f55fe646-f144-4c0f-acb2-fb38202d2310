@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from . import core, publish
 from .store import Dataset, Publication, Store, now_iso
@@ -46,11 +48,16 @@ class NoPublication(ServiceError):
 
 @dataclass
 class DatasetState:
+    """Everything one page render needs, all from one committed snapshot."""
+
     dataset: Dataset
     result: core.CorrectionResult
     anchors: list[core.AnchorInput]
     latest: Publication | None
     publications: list[Publication]
+    # files of ``latest`` (empty when nothing is published yet), read in the
+    # same snapshot as everything else
+    files: list[sqlite3.Row] = field(default_factory=list)
 
     @property
     def pending_seqs(self) -> list[int]:
@@ -67,6 +74,12 @@ class Service:
         # single uvicorn worker (see docker-compose.yml) because revision
         # allocation and the rename step rely on this lock.
         self._publish_lock = threading.Lock()
+        # Test instrumentation, never set in production: when assigned,
+        # ``state()`` invokes this callable after the correction inputs have
+        # been read and before the publication rows are read.  Regression
+        # tests use it to commit a supplement in the middle of a page read
+        # and prove the response still comes from one committed snapshot.
+        self.state_read_hook: Callable[[], None] | None = None
         self.recovered = self._recover()
 
     # ------------------------------------------------------------------
@@ -103,16 +116,38 @@ class Service:
         return self.store.list_datasets()
 
     def state(self, dataset_id: int) -> DatasetState:
-        ds = self.dataset(dataset_id)
-        readings = self.store.readings(dataset_id)
-        anchors = self.store.anchors(dataset_id)
+        """Assemble one page render from a single committed snapshot.
+
+        Every query runs inside one SQLite read transaction, so the segment
+        correction, the pending list, the anchors, the current publication and
+        its file directory all belong to the same committed publication.  A
+        supplement that commits while the page is being assembled can only
+        shift the whole snapshot to the newer commit — it can never mix the
+        old anchors (24 pending readings) with the new publication row
+        (pending 0, new day files), which is what separate connections did.
+        """
+        with self.store.snapshot() as conn:
+            ds = self.store.get_dataset(dataset_id, conn)
+            if ds is None:
+                raise DatasetNotFound(f"批次 {dataset_id} 不存在")
+            readings = self.store.readings(dataset_id, conn)
+            anchors = self.store.anchors(dataset_id, conn)
+            hook = self.state_read_hook
+            if hook is not None:
+                hook()
+            latest = self.store.latest_publication(dataset_id, conn)
+            publications = self.store.publications(dataset_id, conn)
+            files = (
+                self.store.files(latest.id, conn) if latest is not None else []
+            )
         result = core.correct(readings, anchors)
         return DatasetState(
             dataset=ds,
             result=result,
             anchors=anchors,
-            latest=self.store.latest_publication(dataset_id),
-            publications=self.store.publications(dataset_id),
+            latest=latest,
+            publications=publications,
+            files=files,
         )
 
     # ------------------------------------------------------------------
@@ -232,10 +267,11 @@ class Service:
     # ------------------------------------------------------------------
 
     def publication_files(self, publication_id: int):
-        publication = self.store.get_publication(publication_id)
-        if publication is None:
-            raise NoPublication(f"发布版本 {publication_id} 不存在")
-        return publication, self.store.files(publication_id)
+        with self.store.snapshot() as conn:
+            publication = self.store.get_publication(publication_id, conn)
+            if publication is None:
+                raise NoPublication(f"发布版本 {publication_id} 不存在")
+            return publication, self.store.files(publication_id, conn)
 
     def publication_days(self, publication_id: int) -> list[str]:
         return [
@@ -251,13 +287,18 @@ class Service:
         committed publication are reachable.  The recorded SHA-256 must still
         match the bytes on disk, which turns a truncated copy into a clear
         error rather than a silently corrupt download.
+
+        Publication rows are immutable once committed, but the two lookups
+        still share one read snapshot so a resolved file can never come from
+        a different commit than its publication.
         """
-        publication = self.store.get_publication(publication_id)
-        if publication is None:
-            raise NoPublication(f"发布版本 {publication_id} 不存在")
-        row = self.store.get_file(publication_id, kind, day)
-        if row is None:
-            raise NoPublication("该版本中没有对应的文件")
+        with self.store.snapshot() as conn:
+            publication = self.store.get_publication(publication_id, conn)
+            if publication is None:
+                raise NoPublication(f"发布版本 {publication_id} 不存在")
+            row = self.store.get_file(publication_id, kind, day, conn)
+            if row is None:
+                raise NoPublication("该版本中没有对应的文件")
         path = publish.resolve(
             self.export_root,
             publication.dataset_id,

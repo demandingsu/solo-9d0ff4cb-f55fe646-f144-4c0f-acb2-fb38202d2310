@@ -84,22 +84,21 @@ def _state_context(
     error: str | None = None,
     notice: str | None = None,
 ) -> dict:
+    # state() reads the dataset, anchors, current publication and its file
+    # directory inside one SQLite snapshot, so everything rendered below
+    # belongs to the same committed publication.
     state = get_service().state(dataset_id)
     latest = state.latest
-    files = (
-        [
-            {
-                "kind": row["kind"],
-                "day": row["day"],
-                "relpath": row["relpath"],
-                "size": row["size"],
-                "sha256": row["sha256"],
-            }
-            for row in get_service().store.files(latest.id)
-        ]
-        if latest is not None
-        else []
-    )
+    files = [
+        {
+            "kind": row["kind"],
+            "day": row["day"],
+            "relpath": row["relpath"],
+            "size": row["size"],
+            "sha256": row["sha256"],
+        }
+        for row in state.files
+    ]
     return {
         "dataset": state.dataset,
         "result": state.result,
