@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>野外水质探头 · 时钟回拨校时</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">水质探头 · 时钟回拨校时</a>
+  <span class="hint">读数原始值只读 · UTC 日文件整版发布</span>
+</header>
+<main>
+  {% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+
+  <section class="panel">
+    <h1>上传探头读数</h1>
+    <p class="muted">
+      读数 CSV 表头 <code>序号,设备时间,溶氧</code>；核时锚点 CSV 表头 <code>序号,UTC</code>。
+      设备时间在序号上不递增处自动分段；锚点采用核定时刻，同段两锚点之间按设备时间线性校时，
+      其余读数进入待核列表。设备时间与溶氧永远按原样保存，不会被校时结果覆盖。
+    </p>
+    <form method="post" action="/datasets" enctype="multipart/form-data" class="stack">
+      <label>批次名称（可选）
+        <input type="text" name="name" maxlength="120" placeholder="例：三号点位 2026-03-01">
+      </label>
+      <label>读数 CSV（必填，序号 / 设备时间 / 溶氧）
+        <input type="file" name="readings" accept=".csv,text/csv" required>
+      </label>
+      <label>核时锚点 CSV（可选，序号 / UTC）
+        <input type="file" name="anchors" accept=".csv,text/csv">
+      </label>
+      <div class="actions">
+        <button type="submit" class="primary">上传并校时</button>
+        <button type="submit" class="secondary" formaction="/demo" formnovalidate>载入演示样例（时钟回拨 + 跨日补锚点）</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>样例文件（可直接保存后上传）</h2>
+    {% for sample in samples %}
+      <details class="sample" {% if loop.first %}open{% endif %}>
+        <summary>{{ sample.title }}</summary>
+        <div class="sample-grid">
+          <div>
+            <h3>读数 CSV</h3>
+            <pre class="code">{{ sample.readings }}</pre>
+          </div>
+          <div>
+            <h3>初始锚点 CSV</h3>
+            <pre class="code">{{ sample.anchors }}</pre>
+            <h3>补交锚点（跨日）</h3>
+            <pre class="code">{{ sample.supplement }}</pre>
+            <h3>再补锚点（读数跨日迁移）</h3>
+            <pre class="code">{{ sample.migration }}</pre>
+            <h3>冲突锚点（应被拒绝）</h3>
+            <pre class="code">{{ sample.conflict }}</pre>
+          </div>
+        </div>
+        <p class="muted">
+          样例中含有一段设备时钟回拨：序号 1–12 设备时间递增，序号 13 起设备时间回拨 4 小时，
+          因此分成两段。初始锚点只覆盖第 1 段，第 2 段整体待核；补交锚点后第 2 段被校时，
+          其中部分读数跨入 UTC 次日，日文件整版重新发布。
+        </p>
+      </details>
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <h2>已上传批次</h2>
+    {% if datasets %}
+      <table class="grid">
+        <thead><tr><th>#</th><th>名称</th><th>读数条数</th><th>上传时间 (UTC)</th><th></th></tr></thead>
+        <tbody>
+        {% for ds in datasets %}
+          <tr>
+            <td>{{ ds.id }}</td>
+            <td>{{ ds.name }}</td>
+            <td>{{ ds.source_rows }}</td>
+            <td class="mono">{{ ds.created_at }}</td>
+            <td><a class="button small" href="/datasets/{{ ds.id }}">打开</a></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">还没有批次。可上传 CSV，或点击“载入演示样例”。</p>
+    {% endif %}
+  </section>
+</main>
+<footer class="foot">
+  <span>原始读数只读</span>·<span>发布过程原子替换，失败保留旧版</span>·<span>旧版链接内容不变</span>
+</footer>
+</body>
+</html>
